@@ -1,0 +1,128 @@
+# @package _global_
+#
+# ZyinkLabs biological age finetuning experiment — Version 1, SOTA-oriented.
+# Run with: cpgpt-train experiment=zyinklabs_bioage
+#
+# Predicts chronological_age from methylation, finetuned on the ComputAgeBench
+# training split (see docs/DATASET.md). This is the same training data CpGPT's own
+# authors used to achieve 2nd place in chronological age estimation on the public
+# Biomarkers of Aging Challenge leaderboard (MAE 2.55 years) — this config aims to
+# reproduce/approach that result, not just "a working model."
+#
+# Every non-obvious setting below is grounded in CpGPT's own README/FAQ
+# (/CpGPT/README.md, /CpGPT/configs/experiment/template.yaml) rather than guessed —
+# see inline citations to that source.
+
+defaults:
+  - override /model/net: large                # ~100M params. Needs 24GB+ VRAM --
+                                               # see aws/README.md for the g6e.xlarge
+                                               # (48GB) instance this assumes.
+  - override /model/optimizer: adamwschedulefree  # Schedule-free optimizer manages
+                                               # its own internal warmup -- this is
+                                               # why it's paired with the "constant"
+                                               # scheduler below, per CpGPT's own
+                                               # template.yaml pairing.
+  - override /model/scheduler: constant
+  - override /logger: csv                     # switch to wandb.yaml for hosted experiment tracking
+  - _self_
+
+tags: ["zyinklabs_bioage", "finetuning", "biological_age", "computagebench"]
+
+seed: 42
+
+# ===== Model Configuration =====
+model:
+  training:
+    binarize_input: false
+
+    # Regression target (chronological age in years) -> mean absolute error.
+    condition_decoder_loss: mae
+
+    # CpGPT FAQ ("How can I get the very best possible performance out of CpGPT?"):
+    # "you can increase generative_splits to 5". This is the explicit
+    # best-performance recommendation, traded against longer training time per
+    # step. We take that trade for Version 1, since the goal is a SOTA-competitive
+    # model, not the fastest training run.
+    #
+    # NOTE on a real discrepancy in CpGPT's own docs: configs/experiment/template.yaml
+    # ships generative_splits: 1 as its baseline default, while the FAQ separately
+    # states the library's own internal default is 2 and recommends 5 for best
+    # results. We're following the FAQ's explicit best-performance guidance here
+    # rather than the template's baseline value -- flagging this so the choice is
+    # visible, not silently inherited.
+    generative_splits: 5
+
+    loss_weights:
+      # CpGPT's own template.yaml default is condition_loss: 0.1 (NOT 0.5 -- an
+      # earlier draft of this config used 0.5, which does not match the shipped
+      # default; corrected here). Start at the documented default and tune from
+      # there: if val/condition_loss plateaus too early relative to val/loss,
+      # try increasing toward 0.2-0.3 in a follow-up run.
+      condition_loss: 0.1
+
+  optimizer:
+    lr: 0.0001
+
+  net:
+    use_condition_decoder: true
+    condition_size: 1   # single regression target: chronological_age
+
+# ===== Training Configuration =====
+trainer:
+  # CpGPT FAQ rule of thumb: aim for each sample-feature combination to be seen
+  # ~50 times. max_steps ~= (N_samples * 50) / batch_size.
+  #
+  # ComputAgeBench training split: 7,419 samples (see docs/DATASET.md).
+  # If using --ridge_select_top_n 20000 in scripts/02_prepare_cpgpt_data.py (the
+  # FAQ-recommended feature-selection step), feature count no longer dominates the
+  # step-count formula the way full coverage (~900K CpG sites) would; the per-sample
+  # exposure is what's being budgeted for here, consistent with the FAQ's framing.
+  # At batch_size: 8 -> (7419 * 50) / 8 ~= 46,400 steps.
+  #
+  # CpGPT's own template.yaml ships max_steps: 100000 as its general-purpose
+  # default. We start from the FAQ-derived 46,400 estimate but keep meaningful
+  # headroom toward the template's 100,000 default, since generative_splits: 5
+  # above means each step sees a different sub-sample of the input -- in practice
+  # this argues for more, not fewer, steps than the naive formula suggests.
+  min_steps: 5000
+  max_steps: 100000
+
+# ===== Data Configuration =====
+data:
+  _target_: cpgpt.data.cpgpt_datamodule.CpGPTDataModule
+
+  batch_size: 8    # Conservative default for the large backbone on a 48GB GPU.
+                   # Watch `nvidia-smi` during the first few hundred steps of a
+                   # real run -- g6e.xlarge's 48GB likely has headroom to increase
+                   # this if --ridge_select_top_n keeps the per-sample feature
+                   # count well below full EPIC coverage (~900K sites).
+
+  train_dir: ${paths.data_dir}/zyinklabs/cpgpt/bioage/train
+  val_dir: ${paths.data_dir}/zyinklabs/cpgpt/bioage/val
+  test_dir: ${paths.data_dir}/zyinklabs/cpgpt/bioage/test
+  dependencies_dir: ${paths.dependencies_dir}/human
+
+  max_length: 20000   # max CpG sites per sample shown to the model per step.
+                       # If --ridge_select_top_n is set below this, every site
+                       # selected is seen every step; if not, this caps coverage
+                       # per step and generative_splits provides the rotation.
+
+# ===== Callback Configuration =====
+callbacks:
+  model_checkpoint:
+    monitor: "val/condition_loss"   # tracks MAE on chronological age
+    mode: "min"
+    filename: "zyinklabs_bioage_step_{step:06d}"
+
+# ===== Checkpoint Configuration =====
+# false because we're loading a pretrained backbone into a (slightly different)
+# finetuning head architecture -- strict_load=true would fail on the new condition
+# decoder layers.
+strict_load: false
+
+# Start from the pretrained large model.
+model_ckpt_path: ${paths.dependencies_dir}/model/weights/large.ckpt
+
+hydra:
+  run:
+    dir: ${paths.log_dir}/experiments/${tags[0]}/${now:%Y-%m-%d_%H-%M-%S}

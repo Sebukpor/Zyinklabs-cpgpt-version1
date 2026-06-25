@@ -1,0 +1,108 @@
+# @package _global_
+#
+# ZyinkLabs disease-risk finetuning experiment — Version 1, exploratory.
+# Run with: cpgpt-train experiment=zyinklabs_disease
+#
+# Predicts condition_class (encoded as integer classes by
+# scripts/02_prepare_cpgpt_data.py's pd.factorize step) from methylation, using
+# ComputAgeBench's labeled aging-accelerating-condition categories.
+#
+# IMPORTANT CONTEXT: this is the harder and more exploratory of the two Version 1
+# models. ComputAgeBench's Condition/Class columns are diagnosis-style labels
+# (healthy vs. a specific named condition), not the longitudinal incident/outcome
+# structure a true mortality or incident-disease model benefits from (the kind
+# GrimAge-style models use, which need years of follow-up data per person -- see
+# docs/DATASET.md and docs/RUNBOOK.md "Decision log"). Treat this model's results
+# as exploratory for Version 1, and revisit outcome-labeled cohort options (e.g.
+# licensed biobank data with real follow-up time) for Version 2 if a true
+# incident-disease/mortality model matters for the product.
+#
+# net.condition_size below MUST match the actual number of condition_class
+# categories from your run of scripts/02_prepare_cpgpt_data.py -- check that
+# script's printed "Category mapping" log line and update condition_size to match
+# before training; the placeholder value here is illustrative, not authoritative.
+
+defaults:
+  - override /model/net: large
+  - override /model/optimizer: adamwschedulefree
+  - override /model/scheduler: constant
+  - override /logger: csv
+  - _self_
+
+tags: ["zyinklabs_disease", "finetuning", "disease_risk", "computagebench"]
+
+seed: 42
+
+# ===== Model Configuration =====
+model:
+  training:
+    binarize_input: false
+
+    # Cross-entropy for multi-class classification (healthy vs. named conditions).
+    # If you instead frame this as binary (any aging-accelerating condition vs.
+    # healthy), switch to "bce" and set net.condition_size: 1.
+    condition_decoder_loss: ce
+
+    # Same FAQ-driven best-performance choice as zyinklabs_bioage.yaml -- see that
+    # file's comments for the full reasoning on why 5, not the template's 1.
+    generative_splits: 5
+
+    loss_weights:
+      # Disease prediction is the primary objective here -- start slightly above
+      # CpGPT's documented 0.1 default (see zyinklabs_bioage.yaml) since classification
+      # signal on an imbalanced, multi-category target benefits from more weight on
+      # the condition loss relative to reconstruction. Tune based on val/condition_loss
+      # vs val/loss trade-off in an exploratory run before committing to a long one.
+      condition_loss: 0.2
+
+  optimizer:
+    lr: 0.00005   # slightly lower LR than the bioage config -- classification heads
+                  # on imbalanced clinical categories can be more prone to overfitting
+                  # early, especially with rare condition categories
+
+  net:
+    use_condition_decoder: true
+    condition_size: 3   # PLACEHOLDER -- set this to the actual number of
+                        # condition_class categories printed by scripts/02_prepare_cpgpt_data.py
+                        # ("Category mapping: ..." log line) before running. Do not
+                        # train with a mismatched value; it will either error or
+                        # silently waste capacity on unused output classes.
+
+# ===== Training Configuration =====
+trainer:
+  # Recompute using the CpGPT FAQ formula (see zyinklabs_bioage.yaml) once you know
+  # the actual sample count for whichever condition_class subset you're training on
+  # -- this will likely be smaller than the full ComputAgeBench benchmark split,
+  # since you should not use the full split (it must stay held out for SOTA
+  # comparison -- see scripts/02_prepare_cpgpt_data.py's guardrail warning).
+  min_steps: 2000
+  max_steps: 60000   # placeholder -- recompute per the FAQ formula for your actual
+                      # condition-labeled cohort size before a real run
+
+# ===== Data Configuration =====
+data:
+  _target_: cpgpt.data.cpgpt_datamodule.CpGPTDataModule
+
+  batch_size: 8   # see zyinklabs_bioage.yaml note -- conservative default for the large backbone
+
+  train_dir: ${paths.data_dir}/zyinklabs/cpgpt/disease/train
+  val_dir: ${paths.data_dir}/zyinklabs/cpgpt/disease/val
+  test_dir: ${paths.data_dir}/zyinklabs/cpgpt/disease/test
+  dependencies_dir: ${paths.dependencies_dir}/human
+
+  max_length: 20000
+
+# ===== Callback Configuration =====
+callbacks:
+  model_checkpoint:
+    monitor: "val/condition_loss"
+    mode: "min"
+    filename: "zyinklabs_disease_step_{step:06d}"
+
+# ===== Checkpoint Configuration =====
+strict_load: false
+model_ckpt_path: ${paths.dependencies_dir}/model/weights/large.ckpt
+
+hydra:
+  run:
+    dir: ${paths.log_dir}/experiments/${tags[0]}/${now:%Y-%m-%d_%H-%M-%S}

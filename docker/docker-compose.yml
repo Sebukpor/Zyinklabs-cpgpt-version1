@@ -1,0 +1,181 @@
+name: zyinklabs-cpgpt
+
+# ---------------------------------------------------------------------------
+# ZyinkLabs CpGPT training pipeline, as a chain of Compose services.
+#
+# Version 1 trains on the public ComputAgeBench dataset only (no wet-lab data --
+# see docs/DATASET.md). Pipeline order:
+#   download_dependencies + download_computage_bench  (parallel, both CPU-only)
+#     -> prepare_data        (CPU-only)
+#       -> train              (GPU -- finetune, validate, push to HF if it passes)
+#         -> benchmark         (GPU -- SOTA comparison, run explicitly, not in `up`)
+#
+# Run individual stages with `docker compose run --rm <service>`, or the default
+# chain with `docker compose up` (services with `depends_on: ...: completed_successfully`
+# run in order and the chain stops if any stage fails). `benchmark` and `inference`
+# are profile-gated and excluded from the default `up` chain -- run them explicitly
+# once you have a published checkpoint to point at.
+#
+# GPU: only `train`, `benchmark`, and `shell` request a GPU. Data download/prep
+# stages run on CPU and don't need the GPU instance to be hot, which matters if
+# you're trying to keep AWS costs down (see aws/README.md for an instance-lifecycle
+# pattern that exploits this).
+# ---------------------------------------------------------------------------
+
+services:
+
+  download_dependencies:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zyinklabs/cpgpt-pipeline:latest
+    environment:
+      - RUN_MODE=download_dependencies
+      - MODEL_NAME=${MODEL_NAME:-large}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+    volumes:
+      - cpgpt_dependencies:/workspace/CpGPT/dependencies
+      - cpgpt_data:/workspace/CpGPT/data
+
+  download_computage_bench:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zyinklabs/cpgpt-pipeline:latest
+    environment:
+      - RUN_MODE=download_computage_bench
+    volumes:
+      - ../data:/workspace/data
+
+  prepare_data:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zyinklabs/cpgpt-pipeline:latest
+    environment:
+      - RUN_MODE=prepare_data
+      - EXPERIMENT_NAME=${EXPERIMENT_NAME:?Set EXPERIMENT_NAME in .env, e.g. zyinklabs_bioage}
+      - TARGET_COLUMN=${TARGET_COLUMN:?Set TARGET_COLUMN in .env, e.g. chronological_age}
+      - PREPARE_INPUT=${PREPARE_INPUT:-/workspace/data/processed/computage/computage_train_merged.feather}
+      - RIDGE_SELECT_TOP_N=${RIDGE_SELECT_TOP_N:-20000}
+    volumes:
+      - ../data:/workspace/data
+      - cpgpt_dependencies:/workspace/CpGPT/dependencies
+      - cpgpt_data:/workspace/CpGPT/data
+    depends_on:
+      download_dependencies:
+        condition: service_completed_successfully
+      download_computage_bench:
+        condition: service_completed_successfully
+
+  train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zyinklabs/cpgpt-pipeline:latest
+    environment:
+      - RUN_MODE=train
+      - EXPERIMENT_NAME=${EXPERIMENT_NAME:?Set EXPERIMENT_NAME in .env}
+      - VAL_LOSS_THRESHOLD=${VAL_LOSS_THRESHOLD:?Set VAL_LOSS_THRESHOLD in .env, e.g. 5.0}
+      - SKIP_PUSH=${SKIP_PUSH:-false}
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_REPO_ID=${HF_REPO_ID}
+      - HF_PRIVATE=${HF_PRIVATE:-true}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+    volumes:
+      - ../data:/workspace/data
+      - cpgpt_dependencies:/workspace/CpGPT/dependencies
+      - cpgpt_data:/workspace/CpGPT/data
+      - cpgpt_logs:/workspace/CpGPT/logs
+    depends_on:
+      prepare_data:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  benchmark:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zyinklabs/cpgpt-pipeline:latest
+    environment:
+      - RUN_MODE=benchmark
+      - CHECKPOINT_PATH=${CHECKPOINT_PATH}
+      - CONFIG_PATH=${CONFIG_PATH}
+      - BENCHMARK_DATA=${BENCHMARK_DATA:-/workspace/data/processed/computage/computage_benchmark_merged.feather}
+      - BENCHMARK_OUT_DIR=${BENCHMARK_OUT_DIR:-/workspace/data/processed/benchmark_results}
+    volumes:
+      - ../data:/workspace/data
+      - cpgpt_dependencies:/workspace/CpGPT/dependencies
+      - cpgpt_logs:/workspace/CpGPT/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles: ["benchmark"]   # excluded from default `docker compose up`; run explicitly
+                              # after a successful train run, pointing CHECKPOINT_PATH/
+                              # CONFIG_PATH at the published checkpoint
+
+  inference:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zyinklabs/cpgpt-pipeline:latest
+    environment:
+      - RUN_MODE=inference
+      - CHECKPOINT_PATH=${CHECKPOINT_PATH}
+      - CONFIG_PATH=${CONFIG_PATH}
+      - INFERENCE_INPUT=${INFERENCE_INPUT}
+      - INFERENCE_OUTPUT=${INFERENCE_OUTPUT:-/workspace/data/processed/predictions.csv}
+    volumes:
+      - ../data:/workspace/data
+      - cpgpt_dependencies:/workspace/CpGPT/dependencies
+      - cpgpt_logs:/workspace/CpGPT/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles: ["inference"]   # excluded from default `docker compose up`; run explicitly
+
+  shell:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zyinklabs/cpgpt-pipeline:latest
+    environment:
+      - RUN_MODE=shell
+    volumes:
+      - ../data:/workspace/data
+      - cpgpt_dependencies:/workspace/CpGPT/dependencies
+      - cpgpt_data:/workspace/CpGPT/data
+      - cpgpt_logs:/workspace/CpGPT/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles: ["debug"]
+    stdin_open: true
+    tty: true
+
+volumes:
+  cpgpt_dependencies:
+  cpgpt_data:
+  cpgpt_logs:

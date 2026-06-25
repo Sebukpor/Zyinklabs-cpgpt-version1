@@ -1,0 +1,13 @@
+# Dependencies for the ZyinkLabs wrapper scripts (scripts/*.py).
+# CpGPT itself is managed separately via Poetry inside the CpGPT/ directory --
+# see scripts/00_setup_environment.sh.
+#
+# Version 1 uses only public ComputAgeBench data (no wet-lab IDAT processing),
+# so methylprep is intentionally not included here.
+
+computage>=0.1.0       # ComputAgeBench dataset access + SOTA clock benchmarking
+huggingface_hub>=0.27.0 # dataset download (script 01) + model push (orchestrate_training.py)
+pandas>=2.0
+pyarrow>=14.0           # .feather/.arrow and .parquet read/write
+scikit-learn>=1.3        # GroupShuffleSplit for participant-level data splitting
+numpy>=1.24

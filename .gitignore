@@ -1,0 +1,26 @@
+# Data — never commit real sample data or PII
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# CpGPT (cloned separately, not vendored into this repo)
+CpGPT/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Credentials — should never live in this repo
+.env
+docker/.env
+*.pem
+aws_credentials*
